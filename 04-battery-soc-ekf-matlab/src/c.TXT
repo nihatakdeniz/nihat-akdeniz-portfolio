@@ -1,0 +1,288 @@
+% run_ekf_optim.m
+% EKF SOC tahmini + GA ve ACO ile Q,R optimizasyonu
+% Tek dosyede: ana akış + alt fonksiyonlar
+% Kullanım: run_ekf_optim
+close all; clear; clc;
+
+%% ------- KULLANICI AYARLARI ------------
+use_real_data = false;   % true ise kendi .mat verinizi kullan (açıklama aşağıda)
+data_filename = 'battery_dataset.mat'; % zaman, I, V, soc_ref değişkenlerini içermeli (opsiyonel)
+Q_nom_Ah = 5.0;          % hücre kapasitesi Ah (örnek)
+R0 = 0.015;              % seri iç direnç (Ohm) - model parametresi (örnek)
+R1 = 0.02; C1 = 2000;    % RC1 (ohm, F) - polarizasyon 1 (örnek)
+R2 = 0.05; C2 = 5000;    % RC2 (ohm, F) - polarizasyon 2 (örnek)
+dt = 1.0;                % örnekleme zamanı (s)
+optimizeP = false;       % true yaparsan P başlangıç kovaryansını optimize eder
+useGAtoolboxIfAvailable = true; % matlab ga toolbox varsa kullan
+doACO = true;            % ACO çalıştırılsın mı?
+
+rng(1) % reproducible
+
+%% ------- Veri yükleme veya üretme ------------
+if use_real_data
+    if exist(data_filename,'file')
+        s = load(data_filename);
+        % Beklenen değişkenler: t, I, V, soc_ref
+        t = s.t; I = s.I; V = s.V; soc_ref = s.soc_ref;
+        if length(t)~=length(I)
+            error('Veri dosyası formatı hatalı: t ve I uzunlukları uyuşmuyor.');
+        end
+    else
+        error('Belirtilen veri dosyası bulunamadı.');
+    end
+else
+    % Sentetik test verisi oluştur
+    T = 3600; % 1 saat veri (s)
+    t = (0:dt:T)'; N = length(t);
+    % Akım profili: rastgele değişimler ve bir referans deşarj
+    I = 2*sin(2*pi*t/600) + 0.5*randn(size(t)); % A (pozitif deşarj kabul ediliyor)
+    I = max(min(I,10),-10);
+    % Gerçek SOC (sentetik ground truth)
+    soc0 = 0.9;
+    soc_ref = zeros(N,1);
+    soc_ref(1)=soc0;
+    for k=2:N
+        soc_ref(k) = soc_ref(k-1) - (I(k-1)*dt)/(Q_nom_Ah*3600); % A->Ah->fraction
+        soc_ref(k) = min(max(soc_ref(k),0),1);
+    end
+    % Gerçek model voltage (thevenin 2RC)
+    [V, ~] = simulate_thevenin(soc_ref, I, t, dt, R0, R1, C1, R2, C2, @ocv_from_soc);
+end
+
+%% ------- EKF başlangıç parametreleri ------------
+% Başlangıç Q (diag q_soc, q_v1, q_v2), R (ölçüm gürültüsü)
+Q0 = diag([1e-7, 1e-6, 1e-6]); % başlangıç guess
+R0_meas = 1e-4;
+P0 = diag([1e-4, 1e-3, 1e-3]);
+
+% Parametre sınırları (optimize edilecek parametreler: q1,q2,q3,r)
+lb = [1e-10, 1e-9, 1e-9, 1e-6]; % alt sınırlar
+ub = [1e-3, 1e-2, 1e-2, 1e-1];   % üst sınırlar
+
+% Maliyet fonksiyonu: MSE between EKF soc and soc_ref
+cost_fun = @(p) ekf_cost(p, t, I, V, soc_ref, dt, Q_nom_Ah, R0, R1, C1, R2, C2);
+
+%% --------- GA Optimizasyonu -------------
+use_ga_toolbox = (exist('ga','file')==2) && useGAtoolboxIfAvailable;
+disp('GA optimizasyonu başlıyor...');
+if use_ga_toolbox
+    % ga requires Global Optimization Toolbox
+    options = optimoptions('ga','Display','iter','PopulationSize',30,'MaxGenerations',40);
+    nvars = 4;
+    [x_ga, fval_ga] = ga(cost_fun, nvars, [],[],[],[], lb, ub, [], options);
+else
+    % Basit custom GA
+    [x_ga, fval_ga] = custom_simple_ga(cost_fun, lb, ub, 30, 40);
+end
+disp('GA tamamlandı.');
+fprintf('GA sonuç: q=[%.3e %.3e %.3e], r=%.3e, MSE=%.5e\n', x_ga(1), x_ga(2), x_ga(3), x_ga(4), fval_ga);
+
+%% --------- ACO Optimizasyonu (isteğe bağlı) -------------
+if doACO
+    disp('ACO optimizasyonu başlıyor...');
+    [x_aco, fval_aco] = simple_aco(cost_fun, lb, ub, 30, 40);
+    disp('ACO tamamlandı.');
+    fprintf('ACO sonuç: q=[%.3e %.3e %.3e], r=%.3e, MSE=%.5e\n', x_aco(1), x_aco(2), x_aco(3), x_aco(4), fval_aco);
+else
+    x_aco = [];
+    fval_aco = [];
+end
+
+%% --------- En iyi sonuçla EKF çalıştırıp görselleştir -------------
+% Karşılaştırma: başlangıç Q0,R0_meas ; GA sonuçları ; ACO sonuçları (varsa)
+params_list = {struct('p', [diag(Q0); R0_meas], 'label','Initial guess'), ...
+               struct('p', [x_ga(1); x_ga(2); x_ga(3); x_ga(4)], 'label','GA-opt')};
+if ~isempty(x_aco)
+    params_list{end+1} = struct('p',[x_aco(1); x_aco(2); x_aco(3); x_aco(4)], 'label','ACO-opt');
+end
+
+figure('Name','SOC Tahminleri');
+hold on;
+plot(t/60, soc_ref, 'k-', 'LineWidth', 1.8, 'DisplayName','Ground truth SOC');
+colors = lines(length(params_list));
+for i=1:length(params_list)
+    % build Q and R from vector
+    pvec = params_list{i}.p;
+    Qdiag = [pvec(1), pvec(2), pvec(3)];
+    Rval = pvec(4);
+    [soc_est, ~, ~] = ekf_soc(t, I, V, dt, Qdiag, Rval, P0, Q_nom_Ah, R0, R1, C1, R2, C2);
+    plot(t/60, soc_est, '--', 'Color', colors(i,:), 'LineWidth', 1.4, 'DisplayName', params_list{i}.label);
+end
+xlabel('Zaman (dakika)'); ylabel('SOC (0-1)');
+legend('Location','best'); grid on;
+
+% Hata grafiği
+figure('Name','SOC Hataları (MSE zamanla)');
+for i=1:length(params_list)
+    pvec = params_list{i}.p;
+    Qdiag = [pvec(1), pvec(2), pvec(3)];
+    Rval = pvec(4);
+    [soc_est, ~, ~] = ekf_soc(t, I, V, dt, Qdiag, Rval, P0, Q_nom_Ah, R0, R1, C1, R2, C2);
+    mse = (soc_est - soc_ref).^2;
+    plot(t/60, movmean(mse,round(60/dt)), 'LineWidth', 1.2, 'DisplayName', params_list{i}.label); hold on;
+end
+xlabel('Zaman (dakika)'); ylabel('MSE (movmean)');
+legend('Location','best'); grid on;
+
+%% --------- Yardımcı/alt fonksiyonlar -------------
+function [V, xhist] = simulate_thevenin(soc, I, t, dt, R0, R1, C1, R2, C2, ocvfun)
+% Basit Thevenin 2RC modelinden uç gerilimi üretir
+N = length(t);
+xhist = zeros(N,3); % SOC, V1, V2
+V = zeros(N,1);
+xhist(1,1)=soc(1);
+xhist(1,2)=0;
+xhist(1,3)=0;
+a1 = exp(-dt/(R1*C1)); b1 = R1*(1-a1);
+a2 = exp(-dt/(R2*C2)); b2 = R2*(1-a2);
+for k=2:N
+    % SOC update (ground-truth provided as argument, but also compute if not)
+    xhist(k,1) = soc(k);
+    % RC dynamics assuming I positive = discharge
+    xhist(k,2) = a1*xhist(k-1,2) + b1*I(k-1);
+    xhist(k,3) = a2*xhist(k-1,3) + b2*I(k-1);
+    V(k) = ocvfun(xhist(k,1)) - xhist(k,2) - xhist(k,3) - R0*I(k);
+end
+V(1) = ocvfun(xhist(1,1)) - xhist(1,2) - xhist(1,3) - R0*I(1);
+end
+
+function ocv = ocv_from_soc(s)
+% Örnek OCV-SOC eğrisi (polinom). Gerçek çalışmanda deneysel eğri koy.
+s = min(max(s,0),1);
+% 5. derece polinom (örnek), ters OCV eğrisi üretir: tipik 3.0-4.2 V aralığı
+ocv = 3.0 + 1.2*s - 0.3*s.^2 + 0.15*s.^3;
+end
+
+function docv = docv_dsoc(s)
+% OCV'nin SOC'ye göre türevi (analitik)
+s = min(max(s,0),1);
+docv = 1.2 - 0.6*s + 0.45*s.^2;
+end
+
+function mse = ekf_cost(p, t, I, V_meas, soc_ref, dt, Q_nom, R0, R1, C1, R2, C2)
+% p = [q1,q2,q3,r] (diagonal Q entries and R scalar)
+Qdiag = p(1:3);
+Rval = p(4);
+P0 = diag([1e-4,1e-3,1e-3]);
+[soc_est, ~, ~] = ekf_soc(t, I, V_meas, dt, Qdiag, Rval, P0, Q_nom, R0, R1, C1, R2, C2);
+mse = mean((soc_est - soc_ref).^2);
+% add small penalty if values are invalid
+if any(isnan(soc_est)) || any(isinf(soc_est))
+    mse = 1e6;
+end
+end
+
+function [soc_est, xhat_hist, Phist] = ekf_soc(t, I, V_meas, dt, Qdiag, Rval, P0, Q_nom, R0, R1, C1, R2, C2)
+% EKF implementasyonu
+N = length(t);
+xhat = [0.9; 0; 0]; % başlangıç tahmini: SOC, V1, V2
+soc_est = zeros(N,1); xhat_hist = zeros(N,3); Phist = zeros(3,3,N);
+P = P0;
+a1 = exp(-dt/(R1*C1)); b1 = R1*(1 - a1);
+a2 = exp(-dt/(R2*C2)); b2 = R2*(1 - a2);
+Qk = diag(Qdiag);
+
+for k=1:N
+    if k==1
+        % kullan xhat başlangıç
+    else
+        % Tahmin adımı (discrete)
+        % SOC: x1_k = x1_{k-1} - I*dt/(Q_nom*3600)
+        xhat_pred = zeros(3,1);
+        xhat_pred(1) = xhat(1) - (I(k-1)*dt)/(Q_nom*3600);
+        xhat_pred(2) = a1*xhat(2) + b1*I(k-1);
+        xhat_pred(3) = a2*xhat(3) + b2*I(k-1);
+        % State transition jacobian F
+        F = [1, 0, 0;
+             0, a1, 0;
+             0, 0, a2];
+        P = F*P*F' + Qk;
+        xhat = xhat_pred;
+    end
+    % Ölçüm tahmini h(x) = OCV(soc) - v1 - v2 - R0*I(k)
+    h = ocv_from_soc(xhat(1)) - xhat(2) - xhat(3) - R0*I(k);
+    % H jacobian: dh/dx = [dOCV/dSOC, -1, -1]
+    H = [docv_dsoc(xhat(1)), -1, -1];
+    S = H*P*H' + Rval;
+    K = (P*H')/S;
+    y = V_meas(k) - h;
+    xhat = xhat + K*y;
+    P = (eye(3) - K*H) * P;
+    % Bound SOC
+    xhat(1) = min(max(xhat(1),0),1);
+    % Store
+    xhat_hist(k,:) = xhat';
+    Phist(:,:,k) = P;
+    soc_est(k) = xhat(1);
+end
+end
+
+function [best_x, best_f] = custom_simple_ga(costfun, lb, ub, popsize, gens)
+% Çok basit GA: popülasyon, roulette selection, tek-point crossover, Gaussian mutation
+nvars = length(lb);
+pop = zeros(popsize,nvars);
+for i=1:popsize
+    pop(i,:) = lb + rand(1,nvars).*(ub-lb);
+end
+fitness = zeros(popsize,1);
+for i=1:popsize, fitness(i) = -costfun(pop(i,:)); end
+[~, idx] = max(fitness); best_x = pop(idx,:); best_f = -fitness(idx);
+for g=1:gens
+    % Selection (tournament)
+    newpop = zeros(size(pop));
+    for i=1:popsize
+        a = randi(popsize); b=randi(popsize);
+        if fitness(a)>fitness(b), newpop(i,:) = pop(a,:); else newpop(i,:) = pop(b,:); end
+    end
+    % Crossover
+    for i=1:2:popsize-1
+        if rand < 0.8
+            cp = randi(nvars-1);
+            p1 = newpop(i,:); p2 = newpop(i+1,:);
+            c1 = [p1(1:cp), p2(cp+1:end)];
+            c2 = [p2(1:cp), p1(cp+1:end)];
+            newpop(i,:) = c1; newpop(i+1,:) = c2;
+        end
+    end
+    % Mutation (Gaussian)
+    for i=1:popsize
+        if rand < 0.3
+            newpop(i,:) = newpop(i,:) + 0.1*randn(1,nvars).*(ub-lb);
+        end
+        % Clip
+        newpop(i,:) = max(min(newpop(i,:),ub),lb);
+    end
+    pop = newpop;
+    for i=1:popsize, fitness(i) = -costfun(pop(i,:)); end
+    [val, idx] = max(fitness);
+    if -val < best_f
+        best_f = -val; best_x = pop(idx,:);
+    end
+    fprintf('CustomGA Gen %d best MSE=%.5e\n', g, -val);
+end
+end
+
+function [best_x, best_f] = simple_aco(costfun, lb, ub, nAnts, nIter)
+% Basit ACO: her ant rastgele çözüm örnekler, en iyi çözümler feromonla güçlendirilir
+nvars = length(lb);
+pher = ones(1,nvars); % her boyut için pheromone (basitleştirilmiş)
+best_x = [];
+best_f = Inf;
+for iter=1:nIter
+    sols = zeros(nAnts,nvars); vals = zeros(nAnts,1);
+    for a=1:nAnts
+        % sample each variable by biased-random (pheromone favors center)
+        u = rand(1,nvars);
+        sols(a,:) = lb + (ub-lb) .* (u.^ (1./(1+pher)));
+        vals(a) = costfun(sols(a,:));
+    end
+    [vmin, idx] = min(vals);
+    if vmin < best_f
+        best_f = vmin; best_x = sols(idx,:);
+    end
+    % Update pheromones: reinforce best, evaporate others
+    pher = 0.9*pher;
+    pher = pher + 0.1*(best_x - lb)./(ub-lb);
+    fprintf('ACO iter %d best MSE=%.5e\n', iter, best_f);
+end
+end

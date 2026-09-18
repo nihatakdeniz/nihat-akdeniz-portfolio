@@ -1,0 +1,266 @@
+% -------------------------------------------------------------------------
+% GELİŞMİŞ EKF SOC TAHMİNİ VE ENTEGRE GENETİK ALGORİTMA (GA)
+% Batarya Modeli: 2RC (Turnigy Graphene Karakteristiğine Uygun)
+% Yazar: (Sizin İçin Düzenlendi)
+% -------------------------------------------------------------------------
+
+function main_battery_simulation()
+    clc; clear; close all;
+
+    %% 1. KULLANICI AYARLARI
+    settings.use_real_data = false;       % [true]: 'battery_dataset.mat' kullan, [false]: Sentetik üret
+    settings.optimize_parameters = false; % [true]: GA ile Q, R, P optimize et, [false]: Sabit değerleri kullan
+    settings.ga_generations = 20;         % GA Nesil sayısı (Daha iyi sonuç için 50+ yapın)
+    settings.ga_pop_size = 30;            % GA Popülasyon büyüklüğü
+
+    %% 2. VERİ YÜKLEME / OLUŞTURMA
+    data = load_or_generate_data(settings.use_real_data);
+    
+    %% 3. BATARYA MODELİ (GERÇEKÇİ DEĞERLER)
+    % Turnigy Graphene gibi yüksek 'C' değerli bataryalar çok düşük iç dirence sahiptir.
+    % Standart 18650 pillerden (R0 ~0.05) ziyade 0.002-0.005 Ohm civarındadır.
+    model.R0 = 0.0045;   % Ohmik Direnç (Ohm)
+    model.R1 = 0.0025;   % 1. RC Direnci (Kısa dönem)
+    model.C1 = 3500;     % 1. RC Kapasitansı (Farad)
+    model.R2 = 0.0060;   % 2. RC Direnci (Uzun dönem)
+    model.C2 = 12000;    % 2. RC Kapasitansı (Farad)
+    model.Q_n = 5.0 * 3600; % 5000 mAh -> As
+
+    %% 4. PARAMETRE OPTİMİZASYONU VEYA SEÇİMİ
+    if settings.optimize_parameters
+        fprintf('Genetik Algoritma ile Q, R ve P optimize ediliyor...\n');
+        fprintf('Bu işlem biraz zaman alabilir. Lütfen bekleyin.\n');
+        
+        % GA'yı çalıştır ve en iyi parametreleri al
+        best_params = custom_genetic_algorithm(data, model, settings);
+        
+        Q_optim = diag([best_params(1), best_params(2), best_params(3)]);
+        R_optim = best_params(4);
+        P_optim = diag([best_params(5), best_params(6), best_params(7)]);
+        
+        fprintf('Optimizasyon Tamamlandı.\n');
+        disp('Bulunan En İyi Parametreler:');
+        disp(['Q (diag): ', num2str(best_params(1:3))]);
+        disp(['R: ', num2str(best_params(4))]);
+    else
+        % Tez/Literatür bazlı "İyi" Başlangıç Değerleri
+        % Q: Sistem gürültüsü (SOC değişimi az, Voltaj değişimi daha dinamik)
+        Q_optim = diag([1.0e-7, 1.0e-5, 1.0e-5]); 
+        % R: Ölçüm gürültüsü (Sensör kalitesine bağlı, genelde 1mV-10mV karesi)
+        R_optim = 1.0e-4; 
+        % P: Başlangıç hata kovaryansı
+        P_optim = diag([1e-3, 1e-4, 1e-4]);
+    end
+
+    %% 5. EKF SİMÜLASYONU (En iyi parametrelerle)
+    results = run_ekf(data, model, Q_optim, R_optim, P_optim);
+
+    %% 6. GÖRSELLEŞTİRME
+    plot_results(data, results);
+end
+
+%% --- YARDIMCI FONKSİYONLAR ---
+
+function data = load_or_generate_data(use_real)
+    if use_real
+        try
+            loaded = load('battery_dataset.mat');
+            data.t = loaded.t;
+            data.I = loaded.I;
+            data.V_meas = loaded.V;
+            data.soc_ref = loaded.soc_ref;
+            data.dt = data.t(2) - data.t(1);
+        catch
+            error('battery_dataset.mat bulunamadı! Lütfen dosyayı oluşturun veya use_real_data = false yapın.');
+        end
+    else
+        % Sentetik DST (Dynamic Stress Test) Benzeri Profil
+        dt = 1; T = 3600;
+        data.t = 0:dt:T;
+        data.dt = dt;
+        
+        % Dinamik Akım Profili
+        I = zeros(size(data.t));
+        I(100:600) = 5;    % 1C Deşarj
+        I(601:900) = 0;    % Dinlenme
+        I(901:1400) = 10;  % 2C Deşarj (Agresif)
+        I(1401:2000) = -2; % Şarj (Rejeneratif frenleme simülasyonu)
+        I(2001:2500) = 2;  % Sürüş
+        data.I = I;
+        
+        % Referans SOC (Coulomb Counting)
+        Q_cap = 5.0 * 3600;
+        soc = zeros(size(data.t));
+        soc(1) = 1.0;
+        for k=1:length(data.t)-1
+            soc(k+1) = soc(k) - (I(k)*dt)/Q_cap;
+        end
+        data.soc_ref = soc;
+        
+        % Sentetik Voltaj (Model + Gürültü)
+        V = zeros(size(data.t));
+        for k=1:length(data.t)
+            [voc, ~] = get_ocv(soc(k));
+            % Basit R0 düşümü ve rastgele gürültü ekle
+            V(k) = voc - I(k)*0.01 - 0.05*exp(-soc(k)*10) + 0.005*randn; 
+        end
+        data.V_meas = V;
+    end
+end
+
+function [voc, docv] = get_ocv(soc)
+    % GERÇEKÇİ LiPo/Li-ion OCV EĞRİSİ (6. Derece Polinom)
+    % Kaynak: Tipik NMC Kimyası verileri üzerinden fit edilmiştir.
+    soc = max(0, min(1, soc)); % Sınırla
+    
+    p = [-12.5, 38.2, -43.5, 22.5, -4.5, 1.0, 3.2]; 
+    % Bu katsayılar tipik bir 3.0V - 4.2V aralığını temsil eder.
+    % Düşük SOC'da dik düşüş, orta bölgede düzlük sağlar.
+    
+    voc = polyval(p, soc);
+    
+    % Türev (Analitik)
+    p_der = polyder(p);
+    docv = polyval(p_der, soc);
+end
+
+function results = run_ekf(data, model, Q, R, P)
+    x = [1.0; 0; 0]; % Başlangıç: [SOC; V1; V2]
+    len = length(data.t);
+    soc_est = zeros(1, len);
+    Vt_est = zeros(1, len);
+    
+    % Zaman sabitleri
+    tau1 = model.R1 * model.C1;
+    tau2 = model.R2 * model.C2;
+    
+    for k = 1:len
+        Ik = data.I(k);
+        Vk = data.V_meas(k);
+        
+        % 1. Tahmin (Prediction)
+        a1 = exp(-data.dt/tau1);
+        a2 = exp(-data.dt/tau2);
+        
+        A = [1, 0, 0; 0, a1, 0; 0, 0, a2];
+        B = [-data.dt/model.Q_n; model.R1*(1-a1); model.R2*(1-a2)];
+        
+        x_minus = A * x + B * Ik;
+        P_minus = A * P * A' + Q;
+        
+        % 2. Düzeltme (Correction)
+        [Voc, dOCV] = get_ocv(x_minus(1));
+        Vt_pred = Voc - x_minus(2) - x_minus(3) - Ik * model.R0;
+        
+        C = [dOCV, -1, -1]; % Jacobian
+        
+        K = (P_minus * C') / (C * P_minus * C' + R);
+        
+        innovation = Vk - Vt_pred;
+        x = x_minus + K * innovation;
+        P = (eye(3) - K * C) * P_minus;
+        
+        % Kayıt
+        soc_est(k) = x(1);
+        Vt_est(k) = Vt_pred;
+    end
+    results.soc_est = soc_est;
+    results.Vt_est = Vt_est;
+    results.rmse = sqrt(mean((data.soc_ref - soc_est).^2));
+end
+
+%% --- CUSTOM GENETIC ALGORITHM (Toolboxsız) ---
+function best_params = custom_genetic_algorithm(data, model, settings)
+    % Optimize edilecek genler: [Q1, Q2, Q3, R, P1, P2, P3] (Logaritmik arama)
+    pop_size = settings.ga_pop_size;
+    generations = settings.ga_generations;
+    num_vars = 7;
+    
+    % Başlangıç Popülasyonu (Log uzayında: 10^-8 ile 10^-1 arası)
+    pop = -8 + ((-1) - (-8)) * rand(pop_size, num_vars);
+    
+    best_fitness_history = [];
+    
+    for gen = 1:generations
+        fitness = zeros(pop_size, 1);
+        
+        % Fitness Hesapla (Her birey için EKF çalıştır)
+        for i = 1:pop_size
+            % Log'dan gerçeğe dönüştür
+            params = 10.^(pop(i, :));
+            Q_cand = diag(params(1:3));
+            R_cand = params(4);
+            P_cand = diag(params(5:7));
+            
+            res = run_ekf(data, model, Q_cand, R_cand, P_cand);
+            % Amaç fonksiyonu: Hem Voltaj hatasını hem SOC hatasını minimize et
+            % Gerçek hayatta sadece Voltaj hatası kullanılır, burada ikisi de.
+            rmse_soc = sqrt(mean((data.soc_ref - res.soc_est).^2));
+            rmse_v = sqrt(mean((data.V_meas - res.Vt_est).^2));
+            
+            fitness(i) = rmse_soc + 0.1 * rmse_v; % Ağırlıklı hata
+        end
+        
+        % En iyi bireyi bul
+        [min_fit, idx] = min(fitness);
+        best_ind = pop(idx, :);
+        best_fitness_history(end+1) = min_fit;
+        
+        fprintf('Nesil %d/%d - En İyi Hata (Cost): %.6f\n', gen, generations, min_fit);
+        
+        % --- SELECTION & CROSSOVER & MUTATION ---
+        new_pop = zeros(size(pop));
+        new_pop(1, :) = best_ind; % Elitizm (En iyiyi koru)
+        
+        for i = 2:pop_size
+            % Turnuva Seçimi
+            p1 = randi(pop_size); p2 = randi(pop_size);
+            if fitness(p1) < fitness(p2), parent1 = pop(p1, :); else, parent1 = pop(p2, :); end
+            
+            p1 = randi(pop_size); p2 = randi(pop_size);
+            if fitness(p1) < fitness(p2), parent2 = pop(p1, :); else, parent2 = pop(p2, :); end
+            
+            % Çaprazlama (Single Point)
+            cut = randi(num_vars-1);
+            child = [parent1(1:cut), parent2(cut+1:end)];
+            
+            % Mutasyon (%10 ihtimalle gen değiştir)
+            if rand < 0.1
+                mut_idx = randi(num_vars);
+                child(mut_idx) = child(mut_idx) + 0.5 * randn; % Küçük değişim
+            end
+            
+            new_pop(i, :) = child;
+        end
+        pop = new_pop;
+    end
+    
+    best_params = 10.^best_ind;
+    
+    figure; plot(best_fitness_history, 'LineWidth', 2);
+    title('GA Optimizasyon Süreci'); xlabel('Nesil'); ylabel('Maliyet (Hata)'); grid on;
+end
+
+function plot_results(data, results)
+    t_min = data.t / 60;
+    
+    figure('Name', 'Gelişmiş EKF Sonuçları', 'Color', 'w');
+    
+    subplot(3,1,1);
+    plot(t_min, data.V_meas, 'k', 'LineWidth', 1); hold on;
+    plot(t_min, results.Vt_est, 'r--', 'LineWidth', 1.5);
+    legend('Ölçülen Voltaj', 'EKF Tahmini');
+    ylabel('Voltaj (V)'); grid on; title('Voltaj Takibi');
+    
+    subplot(3,1,2);
+    plot(t_min, data.soc_ref*100, 'b', 'LineWidth', 1.5); hold on;
+    plot(t_min, results.soc_est*100, 'r--', 'LineWidth', 1.5);
+    legend('Referans SOC', 'EKF Tahmini');
+    ylabel('SOC (%)'); grid on; title('SOC Tahmin Performansı');
+    
+    subplot(3,1,3);
+    err = (data.soc_ref - results.soc_est) * 100;
+    plot(t_min, err, 'k');
+    ylabel('Hata (%)'); xlabel('Zaman (dk)'); grid on;
+    title(['Maks Hata: %', num2str(max(abs(err)), '%.2f'), ' | RMSE: ', num2str(results.rmse, '%.4f')]);
+end
