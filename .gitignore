@@ -1,0 +1,17 @@
+# Byte-compiled Python / Jupyter
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# MATLAB / Simulink
+*.asv
+slprj/
+work/
+
+# Large or local-only artifacts
+*.pth
+*.mat
+*.zip
+*.rar
+.env
+.DS_Store
